@@ -1,5 +1,9 @@
 package cordproject.lol.papercraft;
 
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
@@ -9,6 +13,12 @@ import android.media.SoundPool;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CountDownTimer;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Message;
+import android.os.Messenger;
+import android.os.PowerManager;
 import android.support.wearable.activity.WearableActivity;
 import android.support.wearable.view.BoxInsetLayout;
 import android.support.wearable.view.DismissOverlayView;
@@ -17,6 +27,7 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.google.android.gms.common.ConnectionResult;
 import com.google.android.gms.common.api.GoogleApiClient;
@@ -30,6 +41,8 @@ import com.google.android.gms.wearable.PutDataMapRequest;
 import com.google.android.gms.wearable.PutDataRequest;
 import com.google.android.gms.wearable.Wearable;
 
+import org.greenrobot.eventbus.EventBus;
+
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -40,6 +53,7 @@ import cordproject.lol.papercraft.controller.Controller;
 import cordproject.lol.papercraft.controller.GameController;
 import cordproject.lol.papercraft.controller.SystemController;
 import cordproject.lol.papercraft.ui.GameView;
+import cordproject.lol.papercraft.util.GestureEvents;
 import cordproject.lol.papercraftshared.entity.AchievementData;
 import cordproject.lol.papercraftshared.util.AchievementsUtil;
 import cordproject.lol.papercraftshared.util.SharedConstants;
@@ -203,7 +217,9 @@ public class MainActivity extends WearableActivity implements GoogleApiClient.Co
                 .addApi(Wearable.API)
                 .build();
 
-
+        mWakeLock = ((PowerManager) getSystemService(Context.POWER_SERVICE))
+                .newWakeLock(PowerManager.FULL_WAKE_LOCK, "");
+        mScreenTimer = new ScreenCountDownTimer(10000, 10000);
     }
 
     private Uri getUriForRawFile(int rawResource){
@@ -265,6 +281,12 @@ public class MainActivity extends WearableActivity implements GoogleApiClient.Co
             Log.d("achieve", data.toString(getResources()));
         }
         mGoogleApiClient.connect();
+
+        // Bind AriaService that's running in another process
+        // You can do multiple bindings in any of your Activities or Services
+        Intent intent = new Intent();
+        intent.setComponent(new ComponentName(ARIA_PACKAGE_NAME, ARIA_SERVICE_NAME));
+        bindService(intent, mConnection, Context.BIND_AUTO_CREATE);
     }
 
     @Override
@@ -275,6 +297,12 @@ public class MainActivity extends WearableActivity implements GoogleApiClient.Co
         }
         Wearable.MessageApi.removeListener(mGoogleApiClient, this);
         Wearable.DataApi.removeListener(mGoogleApiClient, this);
+
+        // Unregister AriaService client first before unbind (required)
+        ariaUnregisterClient();
+
+        // Unbind from AriaService
+        unbindService(mConnection);
     }
 
     @Override
@@ -404,4 +432,157 @@ public class MainActivity extends WearableActivity implements GoogleApiClient.Co
         }
         AchievementsUtil.markAchievementSentToServer(prefsKey);
     }
+
+    //
+    // AriaService constants
+    //
+    public static final String ARIA_PACKAGE_NAME = "com.deus_tech.aria";
+    public static final String ARIA_SERVICE_NAME = "com.deus_tech.aria.AriaService";
+
+    public static final int ARIA_MSG_REGISTER_CLIENT = 1;
+    public static final int ARIA_MSG_UNREGISTER_CLIENT = 2;
+    public static final int ARIA_MSG_GESTURE = 3;
+
+    /**
+     * Messenger for communicating with AriaService
+     */
+    private Messenger mAriaService = null;
+
+    /**
+     * Messenger object used by AriaService to send messages to your app
+     */
+    private final Messenger mMessenger = new Messenger(new Handler() {
+        @Override
+        public void handleMessage(Message msg) {
+            if (msg.what == ARIA_MSG_GESTURE) {
+                startScreenLockingTimer();
+                switch (msg.arg1) {
+                    case GestureEvents.ARIA_GESTURE_ENTER :
+                        EventBus.getDefault().post(new GestureEvents.EnterGesture());
+                        break;
+                    case GestureEvents.ARIA_GESTURE_UP :
+                        EventBus.getDefault().post(new GestureEvents.MoveGesture(
+                                GestureEvents.ARIA_GESTURE_UP
+                        ));
+                        break;
+                    case GestureEvents.ARIA_GESTURE_DOWN :
+                        EventBus.getDefault().post(new GestureEvents.MoveGesture(
+                                GestureEvents.ARIA_GESTURE_DOWN
+                        ));
+                        break;
+                }
+            } else {
+                super.handleMessage(msg);
+            }
+        }
+    });
+
+    /**
+     * Standard Android object interacting with services
+     */
+    private ServiceConnection mConnection = new ServiceConnection() {
+        /**
+         * This is called when the connection with the service has been established
+         */
+        public void onServiceConnected(ComponentName className, IBinder service) {
+            switch (className.getClassName()) {
+                // You can have multiple service in your app
+                // So we check if this is AriaService
+                case ARIA_SERVICE_NAME:
+                    // We are communicating with our service through an IDL interface,
+                    // so get a client-side representation of that from the raw service object.
+                    mAriaService = new Messenger(service);
+                    // Register AriaService client to receive gesture messages
+                    ariaRegisterClient();
+                    break;
+
+                // Check your connected services here
+            }
+        }
+
+        /**
+         * This is called when the connection with the service has been unexpectedly disconnected
+         */
+        public void onServiceDisconnected(ComponentName className) {
+            switch (className.getClassName()) {
+                case ARIA_SERVICE_NAME:
+                    ariaUnregisterClient();
+                    mAriaService = null;
+                    break;
+
+                // Check your disconnected services here
+            }
+        }
+    };
+
+    private void ariaRegisterClient() {
+        try {
+            // Send a registration message to AriaService
+            // AriaService will send you gestures until you unregister
+            Message msg = Message.obtain(null, ARIA_MSG_REGISTER_CLIENT);
+            msg.replyTo = mMessenger;
+            mAriaService.send(msg);
+
+            // Show user we are connected to service
+            Toast.makeText(MainActivity.this, "RPC connected", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(MainActivity.this, "RPC error", Toast.LENGTH_SHORT).show();
+            e.getStackTrace();
+        }
+    }
+
+    private void ariaUnregisterClient() {
+        try {
+            // Try to send undegister message
+            Message msg = Message.obtain(null, ARIA_MSG_UNREGISTER_CLIENT);
+            msg.replyTo = mMessenger;
+            mAriaService.send(msg);
+
+            // Show user we are disconnected to service
+            Toast.makeText(MainActivity.this, "RPC disconnected", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            // Connection to service was lost
+            e.getStackTrace();
+        }
+    }
+
+    private PowerManager.WakeLock mWakeLock;
+    private ScreenCountDownTimer mScreenTimer;
+
+    //initiates and starts timer that acquires screen lock
+    // each time gesture is performed
+    private void startScreenLockingTimer() {
+        if (mWakeLock.isHeld()) {
+            mScreenTimer.refresh();
+        } else {
+            mWakeLock.acquire();
+            mScreenTimer.start();
+
+            Log.d("[phoneService]", "screen lock acquired");
+        }
+    }
+
+    //timer that releases the screen lock and refreshes on gestures
+    private class ScreenCountDownTimer extends CountDownTimer {
+        public ScreenCountDownTimer(long millisInFuture, long countDownInterval) {
+            super(millisInFuture, countDownInterval);
+        }
+
+        @Override
+        public void onTick(long millisUntilFinished) {}
+
+        @Override
+        public void onFinish() {
+            if(mWakeLock.isHeld()) {
+                mWakeLock.release();
+                Log.d("[phoneService]", "screen lock released");
+            }
+        }
+
+        public void refresh() {
+            cancel();
+            start();
+        }
+    }
+
 }

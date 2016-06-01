@@ -45,6 +45,11 @@ import cordproject.lol.papercraftshared.graphics.PaperGen;
 
 public class MainView extends FrameLayout implements GameView{
 
+    //it will control the speed of the game
+    //higher the number - slower the pace
+    //standart is 16
+    protected static final int GAME_SPEED = 16;
+
     // touch variables
     protected float downX;
     protected float downY;

@@ -9,16 +9,29 @@ import android.view.MotionEvent;
 import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 
+import org.greenrobot.eventbus.EventBus;
+import org.greenrobot.eventbus.Subscribe;
+
 import java.util.ArrayList;
+import java.util.Timer;
 import java.util.TimerTask;
 
 import cordproject.lol.papercraft.controller.GameController;
+import cordproject.lol.papercraft.util.GestureEvents;
 import cordproject.lol.papercraft.util.MathUtil;
 import cordproject.lol.papercraft.R;
 import cordproject.lol.papercraft.entity.BulletData;
 import cordproject.lol.papercraft.entity.EnemyData;
 
 public class GameplayView extends MainView {
+
+    //this index controls how much movements could ship make from top to bottom by gestures
+    //0.15 - gives 4
+    //0.12 - gives 5
+    //0.1 - gives 6
+    //0.075 - gives 8
+    //0.06 - gives 10
+    private static final float SHIP_MOVEMENT_INDEX = 0.1f;
 
     private float screenRadius;
 
@@ -41,6 +54,8 @@ public class GameplayView extends MainView {
         setWillNotDraw(false);
         initLanes();
         initFrameTask();
+
+        EventBus.getDefault().register(this);
     }
 
     @Override
@@ -218,16 +233,18 @@ public class GameplayView extends MainView {
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         super.onMeasure(widthMeasureSpec, heightMeasureSpec);
-        screenRadius = MeasureSpec.getSize(widthMeasureSpec)/2;
-        maneuverDistance = MeasureSpec.getSize(widthMeasureSpec)/3;
-        startX = screenRadius*.3f;
+        screenRadius = MeasureSpec.getSize(widthMeasureSpec) / 2;
+        maneuverDistance = MeasureSpec.getSize(widthMeasureSpec) / 3;
+        startX = screenRadius * .3f;
         currentX = -shipLength;
-        currentY = getMeasuredHeight()/2;
-        int marginLeft = (int) ((getMeasuredWidth() - levelCompletionDiameter)/2);
-        int marginTop = (int) (getMeasuredHeight()/8 - levelCompletionDiameter/2);
+        currentY = getMeasuredHeight() / 2;
+        int marginLeft = (int) ((getMeasuredWidth() - levelCompletionDiameter) / 2);
+        int marginTop = (int) (getMeasuredHeight() / 8 - levelCompletionDiameter / 2);
 
         levelCompletionRect.set(marginLeft, marginTop, marginLeft + levelCompletionDiameter,
                 marginTop + levelCompletionDiameter);
+
+        moveDelta = getMeasuredHeight() * SHIP_MOVEMENT_INDEX / numberOfMovements;
     }
 
 
@@ -380,7 +397,6 @@ public class GameplayView extends MainView {
 
                         if (Math.abs(deltaY) >= touchSlop) {
                             lastDirection = deltaY > 0 ? BACKWARD : deltaY < 0 ? FORWARD : NEUTRAL;
-
                         }
                         if (event.getPointerCount() == 1) {
                             removeCallbacks(quitRunnable);
@@ -585,5 +601,80 @@ public class GameplayView extends MainView {
             }
         });
         maneuverBack.start();
+    }
+
+    /**
+     * Aria gesture listeners, that receive gestures from ariaService and execute movements
+     * */
+
+    private int numberOfMovements = 10;
+    private float moveDelta;
+
+    @Subscribe
+    public void onMoveGestureEvent(final GestureEvents.MoveGesture gesture) {
+        if (gameController.getGameState() == GameController.PLAYING) {
+            //creating timer that will move ship smoothly
+            new Timer().schedule(new TimerTask() {
+                int iteration = 0;
+
+                @Override
+                public void run() {
+                    if (iteration == numberOfMovements)
+                        this.cancel();
+
+                    synchronized (enemyLock) {
+
+                        switch (gesture.gesture) {
+                            case GestureEvents.ARIA_GESTURE_DOWN:
+                                deltaY = moveDelta;
+                                downDeltaY = lastY + moveDelta - downY;
+                                lastY += moveDelta;
+                                break;
+                            case GestureEvents.ARIA_GESTURE_UP:
+                                deltaY = -moveDelta;
+                                downDeltaY = lastY - moveDelta - downY;
+                                lastY -= moveDelta;
+                                break;
+                        }
+
+                        radiusAngle = MathUtil.lerp(radiusAngle, MathUtil.toDegrees(Math.asin((screenRadius - (currentY + deltaY)) / (screenRadius * 3.f))), 0.9f);
+                        radiusAngle = Math.min(11, Math.max(radiusAngle, -11));
+
+                        currentY = (float) (screenRadius * 3.f * -Math.sin(MathUtil.toRadians(radiusAngle))) + screenRadius;
+                        maneuverY = (float) (currentManeuverDist * Math.sin(Math.toRadians(radiusAngle)));
+                        maneuverX = (float) (currentManeuverDist * Math.cos(Math.toRadians(radiusAngle)));
+                        currentX = (float) ((screenRadius * -Math.cos(MathUtil.toRadians(radiusAngle))) + 1.3f * screenRadius);
+                        transMatrix.reset();
+
+                        if (Math.abs(deltaY) >= touchSlop) {
+                            lastDirection = deltaY > 0 ? BACKWARD : deltaY < 0 ? FORWARD : NEUTRAL;
+                        }
+
+                        iteration++;
+                    }
+
+                }
+            }, 0, MainView.GAME_SPEED);
+        }
+    }
+
+    @Subscribe
+    public void onEnterGestureEvent(GestureEvents.EnterGesture gesture) {
+        synchronized (enemyLock) {
+            switch (gameController.getGameState()) {
+                case GameController.PLAYING:
+                    if (!dead) {
+                        startManeuver();
+                    }
+                    break;
+                case GameController.TITLE:
+                    startGameTitleTransition();
+                    break;
+
+                case GameController.END_STATS:
+                    startStatsFadeOutTransition();
+                    break;
+            }
+        }
     }
 }
